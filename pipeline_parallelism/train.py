@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+import datetime
 import os
 import argparse
+import logging
 
 import torch
 import torch.distributed as dist
@@ -15,6 +17,7 @@ import deepspeed
 from deepspeed.pipe import PipelineModule
 from deepspeed.utils import RepeatingLoader
 
+logging.basicConfig(format='[%(asctime)s] %(filename)s %(funcName)s():%(lineno)i [%(levelname)s] %(message)s', level=logging.DEBUG)
 
 def cifar_trainset(local_rank, dl_path='/tmp/cifar10-data'):
     transform = transforms.Compose([
@@ -59,7 +62,13 @@ def get_args():
                         type=str,
                         default='nccl',
                         help='distributed backend')
+    parser.add_argument('--dataset-dir',
+                        type=str,
+                        default='/tmp',
+                        help='dataset dir')
     parser.add_argument('--seed', type=int, default=1138, help='PRNG seed')
+
+    # 添加--deepspeed_config 参数
     parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
     return args
@@ -71,15 +80,17 @@ def train_base(args):
     # VGG also works :-)
     #net = vgg19(num_classes=10)
     net = AlexNet(num_classes=10)
+    logging.info(f"dataset dir: {args.dataset_dir}")
+    trainset = cifar_trainset(args.local_rank, args.dataset_dir)
 
-    trainset = cifar_trainset(args.local_rank)
-
-    engine, _, dataloader, __ = deepspeed.initialize(
+    # 使用deepspeed初始化model和dataset，返回结果为engine、optimizer、dataloader、lr_scheduler
+    engine,  _, dataloader, __ = deepspeed.initialize(
         args=args,
         model=net,
         model_parameters=[p for p in net.parameters() if p.requires_grad],
         training_data=trainset)
 
+    # 使dataloader可以无限迭代
     dataloader = RepeatingLoader(dataloader)
     data_iter = iter(dataloader)
 
@@ -88,8 +99,11 @@ def train_base(args):
 
     criterion = torch.nn.CrossEntropyLoss()
 
+    # 计算total steps
     total_steps = args.steps * engine.gradient_accumulation_steps()
     step = 0
+
+    # 根据total steps来迭代dataset
     for micro_step in range(total_steps):
         batch = next(data_iter)
         inputs = batch[0].to(engine.device)
@@ -109,7 +123,7 @@ def train_base(args):
 
 def join_layers(vision_model):
     layers = [
-        *vision_model.features,
+        *vision_model.features, # 这里的*表示解包，将features的序列直接复制到layers中
         vision_model.avgpool,
         lambda x: torch.flatten(x, 1),
         *vision_model.classifier,
@@ -120,36 +134,35 @@ def join_layers(vision_model):
 def train_pipe(args, part='parameters'):
     torch.manual_seed(args.seed)
     deepspeed.runtime.utils.set_random_seed(args.seed)
-
-    #
-    # Build the model
-    #
-
-    # VGG also works :-)
-    #net = vgg19(num_classes=10)
+    # 创建模型
     net = AlexNet(num_classes=10)
+
+    # 使用PipelineModule对module进行封装
     net = PipelineModule(layers=join_layers(net),
                          loss_fn=torch.nn.CrossEntropyLoss(),
                          num_stages=args.pipeline_parallel_size,
                          partition_method=part,
                          activation_checkpoint_interval=0)
 
-    trainset = cifar_trainset(args.local_rank)
+    # 创建数据集
+    trainset = cifar_trainset(args.local_rank, args.dataset_dir)
 
+    # 创建deepspeed engine
     engine, _, _, _ = deepspeed.initialize(
         args=args,
         model=net,
         model_parameters=[p for p in net.parameters() if p.requires_grad],
         training_data=trainset)
 
+    # 使用deepspeed engine train_batch来代替custom training loop
     for step in range(args.steps):
         loss = engine.train_batch()
 
 
 if __name__ == '__main__':
     args = get_args()
-
-    deepspeed.init_distributed(dist_backend=args.backend)
+    # 使用deepspeed来初始化分布式
+    deepspeed.init_distributed(dist_backend=args.backend, timeout=datetime.timedelta(seconds=30))
     args.local_rank = int(os.environ['LOCAL_RANK'])
     torch.cuda.set_device(args.local_rank)
 

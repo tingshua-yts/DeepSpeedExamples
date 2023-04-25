@@ -1,6 +1,6 @@
  {
-  "train_batch_size" : 256,
-  "train_micro_batch_size_per_gpu" : 8,
+    "train_batch_size" : 256,
+    "train_micro_batch_size_per_gpu" : 4,
 
    "optimizer": {
     "type": "Adam",
@@ -13,7 +13,13 @@
       "eps": 1e-8
     }
   },
-  
+
   "steps_per_print" : 10,
-  "wall_clock_breakdown" : false
+  "wall_clock_breakdown" : false,
+  "comms_logger": {
+    "enabled": true,
+    "verbose": false,
+    "prof_all": true,
+    "debug": true
+  }
  }
